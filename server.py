@@ -59,10 +59,6 @@ def recv_message(sock):
 
 def handle_client(conn, addr):
     print(f"Client connected: {addr}")
-
-    is_llm_online = check_for_llm()
-    print(f"is llm on: {is_llm_online}")
-    is_stt_online = False
     #Check if ollama is active
     try:
         while True:
@@ -71,30 +67,40 @@ def handle_client(conn, addr):
             #Handle termination of client's connection. 
             if payload is None:
                 print("Client disconnected. \nAwaiting new connection.")
+                llm.reset()
                 break
 
             # Decode ONLY after full payload received
-            request = payload.decode("utf-8")
-            print("Received:", request)
+            # request = payload
+            # print("Received:", request)
 
                 
 
             # Receive the audio and convert it to text
             client_text = "Hello world"
-            if is_stt_online:
+            if is_sst_online:
                 client_text = convert_to_text(payload, whisper_model) #TODO: add payload
+                print(client_text)
             else:
                 print("No SST implemented.")
 
             # Pass the text into the LLM
             llm_text_output = "LLM Text output"
             if is_llm_online:
-                llm_text_output = send_prompt_local(client_text)
+                llm_text_output = llm.ask(client_text)
+
+                def validate_reply(text):
+                    required = ['emotion:', '!@#$', 'text response:', 'shoot:']
+                    return all(token in text for token in required)
+                
+                if not validate_reply(llm_text_output):
+                    llm_text_output = 'emotion: "anger"!@#$ text response: "Formatting failure. Try again."!@#$ shoot: "False"'
+
             else:
                 pass
         
 
-            response = f"Processed: {request} \n {client_text} \n {llm_text_output}"
+            response = f"Processed:  {client_text} \n {llm_text_output}"
             send_message(conn, response.encode("utf-8"))
 
     except ConnectionResetError:
@@ -117,8 +123,22 @@ def run_server():
             handle_client(conn, addr)
 
 
-whisper_model = WhisperModel("base", device="cuda", compute_type="float16")
-
 if __name__ == "__main__":
+
+    is_sst_online = False
+    try:    
+        whisper_model = WhisperModel("base", device="cuda", compute_type="float16")
+        is_sst_online = True
+
+    except Exception as e:
+        print(e) 
+    
+    is_llm_online = False
+    try:
+        llm = LLMContext()
+        is_llm_online = True
+    except Exception as e:
+        print(e)
+        
 
     run_server()
