@@ -134,9 +134,10 @@ if __name__ == "__main__":
         print(e) 
     
     is_llm_online = False
+    is_llm_online = check_for_llm()
     try:
         llm = LLMContext()
-        is_llm_online = True
+        print(f"LLM is: {is_llm_online}")
     except Exception as e:
         print(e)
         
