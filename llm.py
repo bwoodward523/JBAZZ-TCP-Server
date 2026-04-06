@@ -22,22 +22,22 @@ Output rules (CRITICAL):
 
 - Output must be a SINGLE LINE.
 - Output must contain EXACTLY THREE fields.
-- Fields must be character sequence !@#$
+- Fields must be character sequence @#$
 - No additional words, labels, or commentary.
 
 Required format:
 
-emotion: "<emotion>"!@#$ text response: "<response>"!@#$ shoot: "<True or False>"
+emotion:<emotion>@#$ text response:<response>@#$ shoot:<True or False>
 
 Field constraints:
 
-- "<emotion>" must be one of the six allowed emotions.
-- "<response>" must be short and in character.
-- "<True or False>" must be capitalized exactly.
+- <emotion> must be one of the six allowed emotions.
+- <response> must be in character
+- <True or False> must be capitalized exactly.
 
 Example valid output:
 
-emotion: "anger"!@#$ text response: "Oh great, you're back."!@#$ shoot: "True"
+emotion:anger@#$text response:Oh great, you're back.@#$ shoot:True
 """
 
 def check_for_llm():

@@ -63,7 +63,7 @@ def handle_client(conn, addr):
     try:
         while True:
             payload = recv_message(conn)
-
+            # print(f"Payload: {payload}")
             #Handle termination of client's connection. 
             if payload is None:
                 print("Client disconnected. \nAwaiting new connection.")
@@ -90,18 +90,19 @@ def handle_client(conn, addr):
                 llm_text_output = llm.ask(client_text)
 
                 def validate_reply(text):
-                    required = ['emotion:', '!@#$', 'text response:', 'shoot:']
+                    required = ['emotion:', '@#$', 'text response:', 'shoot:']
                     return all(token in text for token in required)
                 
                 if not validate_reply(llm_text_output):
-                    llm_text_output = 'emotion: "anger"!@#$ text response: "Formatting failure. Try again."!@#$ shoot: "False"'
+                    llm_text_output = 'emotion: "anger"@#$ text response: "Formatting failure. Try again."@#$ shoot: "False"'
 
             else:
                 pass
         
 
-            response = f"Processed:  {client_text} \n {llm_text_output}"
+            response = f"Processed:  {client_text}@#$ {llm_text_output}"
             send_message(conn, response.encode("utf-8"))
+            print(f"Sent message f{response}")
 
     except ConnectionResetError:
         print("Client crashed / reset connection.")
