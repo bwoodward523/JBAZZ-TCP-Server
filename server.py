@@ -94,8 +94,8 @@ def handle_client(conn, addr):
                     return all(token in text for token in required)
                 
                 if not validate_reply(llm_text_output):
+                    print(f"Invalid output from LLM: {llm_text_output}")
                     llm_text_output = 'emotion: "anger"@#$ text response: "Formatting failure. Try again."@#$ shoot: "False"'
-
             else:
                 pass
         
@@ -114,14 +114,22 @@ def handle_client(conn, addr):
 def run_server():
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1.0)
         s.bind((HOST, PORT))
         s.listen(1)
 
         print(f"Listening on {HOST}:{PORT}")
 
-        while True:
-            conn, addr = s.accept()
-            handle_client(conn, addr)
+        try:
+            while True:
+                try:
+                    conn, addr = s.accept()
+                    handle_client(conn, addr)
+                except socket.timeout:
+                    #This allows us to use KeyboardInterrupt 
+                    pass
+        except KeyboardInterrupt:
+            print("Server closed with KeyboardInterrupt")
 
 
 if __name__ == "__main__":
