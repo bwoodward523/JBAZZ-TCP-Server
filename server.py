@@ -91,7 +91,7 @@ def consume_llm_stream(character_queue, conn):
     swords = []
     while True:
         chunk = character_queue.get()
-        # print(f"Chunk we are reading: {chunk}")
+        print(f"{chunk}")
 
         assert type(chunk) == str
         #Extend the s string with the new chunk streamed 
@@ -120,11 +120,13 @@ def consume_llm_stream(character_queue, conn):
 
             d_result = has_delimiter(s)
             if d_result:
+                print(f"D_result from characters delimiter found: {d_result}")
                 #Send any final data from the left of the delimiter
                 extra_data = d_result[0]
                 byte_payload = extra_data.encode('utf-8')
                 send_message(conn, byte_payload)
-
+                #Ensure right half gets saved into s 
+                s = d_result[1]
                 #Terminate the word streaming state. 
                 LLM_STATE = LLM_OUTPUT_STATE.SHOOT
                 s2 = '''##TerminateCharacterStreamState##'''
@@ -136,9 +138,14 @@ def consume_llm_stream(character_queue, conn):
                 # #Reset delimiter tracker
                 # character_stream_delimiter_counter = 0
 
+            #Yeah so this is a magic line that checks to see if we have the @ symbol for the delimiter.
+            #It stops the '.' character at the end of the Character Stream from counting the following @symbol as a word lol.
+            if s.count('@') == 1:
+                continue
+            
             #This means that we have a completed word in our buffer. 
             #Delimiter must not be in play otherwise we could send it as text to speak.
-            elif re.search(r"""[ ,;:!?.'"]""", s):
+            elif re.search(r"""[ ,;:!?."]""", s):
                 #this means that we need to send this word to JBAZZ
                 byte_payload = s.encode('utf-8')
                 send_message(conn, byte_payload)

@@ -30,7 +30,7 @@ Output rules (CRITICAL):
 
 Required format:
 
-emotion:<emotion>@#$ text response:<response>@#$ shoot:<True or False>@#$
+emotion:<emotion>@#$<response>@#$ shoot:<True or False>@#$
 
 Field constraints:
 
@@ -40,7 +40,7 @@ Field constraints:
 
 Example valid output:
 
-emotion:anger@#$text response:Oh great, you're back.@#$ shoot:True@#$
+emotion:anger@#$Oh great, you're back.@#$ shoot:True@#$
 """
 
 def check_for_llm():
