@@ -26,7 +26,8 @@ import struct
 from llm import * 
 from sst import *
 from faster_whisper import WhisperModel
-
+import queue
+import threading
 
 
 HOST = "0.0.0.0" #Temporary host to listen to all possible connections
@@ -56,9 +57,124 @@ def recv_message(sock):
     length = struct.unpack("!I", header)[0]
     return recv_exact(sock, length)
 
+from enum import Enum
+#Class to indicate which state of outputting in the LLM we are in. 
+class LLM_OUTPUT_STATE(Enum):
+    NONE = -1
+    EMOTION = 0
+    CHARACTERS = 1
+    SHOOT = 2
+DELIMITER = '@#$'
+
+#Thread for handling the data as it comes 
+def consume_llm_stream(character_queue, conn):       
+    
+    def has_delimiter(s):
+        #If it finds the delimiter. 
+        #It should attempt to get the content to the left and right of the delimiter.
+        #Return this content in a tuple pair. 
+        #Refactor state code to use left side as message and the right side as the start of s. 
+        if s.count("@#$") == 1:
+            print(f"Delimter exists within s: {s}")
+
+            #Extract left and right content of delimiter
+            s = s.split("@#$")
+            print(f"split array {s}")
+
+            return (s[0], s[1])
+        else:
+            return None
+        
+    LLM_STATE = LLM_OUTPUT_STATE.EMOTION
+    s = ''
+    full_response = ''
+    swords = []
+    while True:
+        chunk = character_queue.get()
+        # print(f"Chunk we are reading: {chunk}")
+
+        assert type(chunk) == str
+        #Extend the s string with the new chunk streamed 
+        s += chunk
+        full_response += chunk
+        if LLM_STATE == LLM_OUTPUT_STATE.EMOTION:
+            d_result = has_delimiter(s)
+            if d_result:
+                print(f"Current state of s when emotion is ready: {s}")
+                #Send the emotion to JBAZZ. We can remove the delimiter. 
+                emotion = d_result[0]
+                print(f"emotion {emotion}")
+                byte_payload = emotion.encode('utf-8')
+
+                send_message(conn, byte_payload)
+
+                #Update the state
+                LLM_STATE = LLM_OUTPUT_STATE.CHARACTERS
+
+                #Clear the buffer
+                s = d_result[1]
+
+            else: continue
+
+        elif LLM_STATE == LLM_OUTPUT_STATE.CHARACTERS:
+
+            d_result = has_delimiter(s)
+            if d_result:
+                #Send any final data from the left of the delimiter
+                extra_data = d_result[0]
+                byte_payload = extra_data.encode('utf-8')
+                send_message(conn, byte_payload)
+
+                #Terminate the word streaming state. 
+                LLM_STATE = LLM_OUTPUT_STATE.SHOOT
+                s2 = '''##TerminateCharacterStreamState##'''
+                print(f"sending done from char stream {s2}")
+                byte_payload = '''##TerminateCharacterStreamState##'''.encode('utf-8')
+                #Send message to JBAZZ that Shoot is next.
+                send_message(conn, byte_payload)
+
+                # #Reset delimiter tracker
+                # character_stream_delimiter_counter = 0
+
+            #This means that we have a completed word in our buffer. 
+            #Delimiter must not be in play otherwise we could send it as text to speak.
+            elif re.search(r"""[ ,;:!?.'"]""", s):
+                #this means that we need to send this word to JBAZZ
+                byte_payload = s.encode('utf-8')
+                send_message(conn, byte_payload)
+                # print(f"sent s word {s}")
+                swords.append(s)
+                s = ''
+
+        
+        elif LLM_STATE == LLM_OUTPUT_STATE.SHOOT:
+            d_result = has_delimiter(s)
+            if d_result:
+                print(f"Current state of s when SHOOT is ready: {s}")
+                #Send the emotion to JBAZZ. We can remove the delimiter. 
+                shoot = d_result[0]
+                print(f"shoot {shoot}")
+                byte_payload = shoot.encode('utf-8')
+
+                send_message(conn, byte_payload)
+
+                #Update the state
+                LLM_STATE = LLM_OUTPUT_STATE.NONE
+
+                #Clear the buffer
+                s = d_result[1]
+
+                #Break the loop allowing the thread to join
+                break
+            else: continue
+
+    print(f"thread completed, full LLM response: \n{full_response}\n")
+    print(f"Words segmented: {swords}")
+
 
 def handle_client(conn, addr):
     print(f"Client connected: {addr}")
+    character_queue = queue.Queue()
     #Check if ollama is active
     try:
         while True:
@@ -69,11 +185,6 @@ def handle_client(conn, addr):
                 print("Client disconnected. \nAwaiting new connection.")
                 llm.reset()
                 break
-
-            # Decode ONLY after full payload received
-            # request = payload
-            # print("Received:", request)
-
                 
 
             # Receive the audio and convert it to text
@@ -86,18 +197,17 @@ def handle_client(conn, addr):
 
             # Pass the text into the LLM
             llm_text_output = "LLM Text output"
+            
             if is_llm_online:
-                llm_text_output = llm.ask(client_text)
+                #Run this in a thread b4 the llm ask call. 
+                #Iterate over the data queue until llm.ask finishes and the queue it created has been consumed. 
+                consume_llm_thread = threading.Thread(target=consume_llm_stream, args=(character_queue, conn))
+                consume_llm_thread.start()
+                llm_text_output = llm.ask(client_text, character_queue)
+                consume_llm_thread.join()
 
-                def validate_reply(text):
-                    required = ['emotion:', '@#$', 'text response:', 'shoot:']
-                    return all(token in text for token in required)
-                
-                if not validate_reply(llm_text_output):
-                    print(f"Invalid output from LLM: {llm_text_output}")
-                    llm_text_output = 'emotion: "anger"@#$ text response: "Formatting failure. Try again."@#$ shoot: "False"'
             else:
-                pass
+                print("Error handling client: LLM is not online")
         
 
             response = f"Processed:  {client_text}@#$ {llm_text_output}"

@@ -1,6 +1,9 @@
 import requests
 import json
-
+import http
+import ollama
+import queue
+import re
 SYSTEM_PROMPT = """
 You are JBAZZ, a physically embodied robot with a digital face capable of displaying exactly six emotions:
 
@@ -27,7 +30,7 @@ Output rules (CRITICAL):
 
 Required format:
 
-emotion:<emotion>@#$ text response:<response>@#$ shoot:<True or False>
+emotion:<emotion>@#$ text response:<response>@#$ shoot:<True or False>@#$
 
 Field constraints:
 
@@ -37,7 +40,7 @@ Field constraints:
 
 Example valid output:
 
-emotion:anger@#$text response:Oh great, you're back.@#$ shoot:True
+emotion:anger@#$text response:Oh great, you're back.@#$ shoot:True@#$
 """
 
 def check_for_llm():
@@ -55,7 +58,7 @@ def check_for_llm():
 
 
 class LLMContext:
-    def __init__(self, model_name="llama3", max_history=12):
+    def __init__(self, model_name="llama3", max_history=16):
         self.model_name = model_name
         self.max_history = max_history
         self.messages = [
@@ -67,32 +70,37 @@ class LLMContext:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "assistant", "content": "Formatting rules acknowledged."}
         ]
-    def ask(self, user_text):
+    def ask(self, user_text, character_queue):
         # Append user message
         self.messages.append({"role": "user", "content": user_text})
-
         # Trim history to avoid context drift
         if len(self.messages) > self.max_history:
             self.messages = [self.messages[0]] + self.messages[-(self.max_history-1):]
-
-        url = "http://localhost:11434/api/chat"
-        data = {
-            "model": self.model_name,
-            "messages": self.messages,
-            "stream": False
-        }
-
+        # url = "http://localhost:11434/api/chat"
+        chat = ollama.chat(
+            model= self.model_name,
+            messages=self.messages,
+            stream= True,
+        )
         try:
-            response = requests.post(url, json=data)
-            response.raise_for_status()
-            result = response.json()
+            for chunk in chat:
+                # print(chunk['message']['content'], end ='', flush=True)
+                character_queue.put(chunk['message']['content'])
 
-            assistant_reply = result["message"]["content"]
+            # response = requests.post(url, json=chat)
+            # response.raise_for_status()
+            # stream = response.json()
+          
+            # assistant_reply = result["message"]["content"]
 
             # Store assistant reply so model sees its own past outputs
-            self.messages.append({"role": "assistant", "content": assistant_reply})
+            # self.messages.append({"role": "assistant", "content": assistant_reply})
 
-            return assistant_reply
+            # return assistant_reply
 
         except requests.exceptions.RequestException as e:
+            print(f"Error: {e}")
+            return f"Error: {e}"
+        except Exception as e:
+            print(f"Error: {e}")
             return f"Error: {e}"
