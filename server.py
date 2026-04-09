@@ -117,12 +117,14 @@ def consume_llm_stream(character_queue, conn):
             else: continue
 
         elif LLM_STATE == LLM_OUTPUT_STATE.CHARACTERS:
-
+            r = re.search(r"""[ ,;:!?."]""", s)
             d_result = has_delimiter(s)
             if d_result:
                 print(f"D_result from characters delimiter found: {d_result}")
                 #Send any final data from the left of the delimiter
                 extra_data = d_result[0]
+                swords.append(extra_data)
+
                 byte_payload = extra_data.encode('utf-8')
                 send_message(conn, byte_payload)
                 #Ensure right half gets saved into s 
@@ -142,16 +144,25 @@ def consume_llm_stream(character_queue, conn):
             #It stops the '.' character at the end of the Character Stream from counting the following @symbol as a word lol.
             if s.count('@') == 1:
                 continue
-            
+
             #This means that we have a completed word in our buffer. 
             #Delimiter must not be in play otherwise we could send it as text to speak.
-            elif re.search(r"""[ ,;:!?."]""", s):
-                #this means that we need to send this word to JBAZZ
-                byte_payload = s.encode('utf-8')
-                send_message(conn, byte_payload)
-                # print(f"sent s word {s}")
-                swords.append(s)
-                s = ''
+            #r is a regex defined above.
+            elif r:
+                if r:
+                    #Check if the data to the left of the matched character 
+                    complete = s[:r.end()]
+                    if complete:
+                        send_message(conn, complete.encode('utf-8'))
+                        swords.append(complete)
+                    #Keep right half which might have incomplete tokens
+                    s = s[r.end():]
+                # #this means that we need to send this word to JBAZZ
+                # byte_payload = s.encode('utf-8')
+                # send_message(conn, byte_payload)
+                # # print(f"sent s word {s}")
+                # swords.append(s)
+                # s = ''
 
         
         elif LLM_STATE == LLM_OUTPUT_STATE.SHOOT:
@@ -183,6 +194,10 @@ def handle_client(conn, addr):
     print(f"Client connected: {addr}")
     character_queue = queue.Queue()
     #Check if ollama is active
+    #Clear the chat history
+    llm.reset()
+    
+
     try:
         while True:
             payload = recv_message(conn)
@@ -217,9 +232,9 @@ def handle_client(conn, addr):
                 print("Error handling client: LLM is not online")
         
 
-            response = f"Processed:  {client_text}@#$ {llm_text_output}"
-            send_message(conn, response.encode("utf-8"))
-            print(f"Sent message f{response}")
+            # response = f"Processed:  {client_text}@#$ {llm_text_output}"
+            # send_message(conn, response.encode("utf-8"))
+            # print(f"Sent message f{response}")
 
     except ConnectionResetError:
         print("Client crashed / reset connection.")
