@@ -21,41 +21,26 @@
 # like speech interruptions, this could include a timer or some indication that JBAZZ was cutoff and may make him angry.
 
 
+import os
+import re
 import socket
-import struct 
 from llm import * 
 from sst import *
 from faster_whisper import WhisperModel
 import queue
 import threading
 
+from tcp_framing import MessageType, recv_message, send_message, send_typed_message
+
 
 HOST = "0.0.0.0" #Temporary host to listen to all possible connections
 PORT = 5555  
 
-def recv_exact(sock, n):
-    buffer = b''
-    while len(buffer) < n:
-        chunk = sock.recv(n - len(buffer))
-        if not chunk:
-            return None
-        buffer += chunk
-    return buffer
+# Off by default: stream Kokoro TIMING_DATA + AUDIO_CHUNK after sentence boundaries.
+# Set JBAZZ_LLM_WORD_STREAM=1 to restore legacy word-at-a-time UTF-8 frames (no server TTS).
+USE_LLM_WORD_STREAM_FALLBACK = os.environ.get("JBAZZ_LLM_WORD_STREAM", "").strip().lower() in ("1", "true", "yes")
 
-
-def send_message(sock, payload: bytes):
-    header = struct.pack("!I", len(payload))
-    sock.sendall(header)
-    sock.sendall(payload)
-
-
-def recv_message(sock):
-    header = recv_exact(sock, 4)
-    if header is None:
-        return None
-
-    length = struct.unpack("!I", header)[0]
-    return recv_exact(sock, length)
+server_tts = None
 
 from enum import Enum
 #Class to indicate which state of outputting in the LLM we are in. 
@@ -66,9 +51,104 @@ class LLM_OUTPUT_STATE(Enum):
     SHOOT = 2
 DELIMITER = '@#$'
 
-#Thread for handling the data as it comes 
-def consume_llm_stream(character_queue, conn):       
-    
+_SENTENCE_BOUNDARY = re.compile(r"[.!?;\n]")
+
+# Default emotion if the LLM stream ends before the first @#$ (allowed six emotions in SYSTEM_PROMPT).
+DEFAULT_EMOTION_EOS = "emotion:surprise"
+_LEGACY_TERMINATE = "##TerminateCharacterStreamState##"
+
+
+def parse_shoot_to_payload(shoot_field: str) -> bytes:
+    """Map LLM shoot field ('shoot:True', etc.) to protocol UTF-8 b'True' / b'False'."""
+    t = shoot_field.strip()
+    if t.startswith("shoot:"):
+        t = t[6:].strip()
+    low = t.lower()
+    if low.startswith("true"):
+        return b"True"
+    if low.startswith("false"):
+        return b"False"
+    return b"False"
+
+
+def _split_response_into_sentences(text: str) -> list[str]:
+    if not text.strip():
+        return []
+    parts = re.split(r"(?<=[.!?;\n])\s+", text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _emit_eos_phase_gaps(
+    conn,
+    use_sentence_tts: bool,
+    emotion_phase_done: bool,
+    dialogue_closed: bool,
+    shoot_phase_done: bool,
+    llm_state: LLM_OUTPUT_STATE,
+    buf: str,
+    has_delimiter_fn,
+) -> tuple[bool, bool, bool]:
+    """Emit missing protocol phases so Pi recv state matches server (truncated LLM stream). Order:
+    legacy: EMOTION -> (word frames) -> ##TerminateCharacterStreamState## -> SHOOT field.
+    typed: EMOTION -> TIMING_DATA/AUDIO_CHUNK... -> END_OF_RESPONSE -> SHOOT payload.
+    Only sends frames that were not yet sent (flags). Returns updated (emotion, dialogue, shoot) flags."""
+    patched: list[str] = []
+
+    if not emotion_phase_done:
+        if use_sentence_tts:
+            send_typed_message(
+                conn, MessageType.EMOTION, DEFAULT_EMOTION_EOS.encode("utf-8")
+            )
+        else:
+            send_message(conn, DEFAULT_EMOTION_EOS.encode("utf-8"))
+        emotion_phase_done = True
+        patched.append("emotion")
+
+    if use_sentence_tts:
+        if not dialogue_closed:
+            send_typed_message(conn, MessageType.END_OF_RESPONSE, b"")
+            dialogue_closed = True
+            patched.append("end_of_response")
+    else:
+        if not dialogue_closed:
+            send_message(conn, _LEGACY_TERMINATE.encode("utf-8"))
+            dialogue_closed = True
+            patched.append("terminate")
+
+    if not shoot_phase_done:
+        dr = has_delimiter_fn(buf) if buf else None
+        if use_sentence_tts:
+            if llm_state == LLM_OUTPUT_STATE.SHOOT and dr is not None:
+                send_typed_message(
+                    conn, MessageType.SHOOT, parse_shoot_to_payload(dr[0])
+                )
+            else:
+                send_typed_message(conn, MessageType.SHOOT, b"False")
+        else:
+            if llm_state == LLM_OUTPUT_STATE.SHOOT and dr is not None:
+                send_message(conn, dr[0].encode("utf-8"))
+            else:
+                send_message(conn, b"shoot:False")
+        shoot_phase_done = True
+        patched.append("shoot")
+
+    if patched:
+        print(f"EOS gap fill (synthesized phases): {', '.join(patched)}")
+
+    return emotion_phase_done, dialogue_closed, shoot_phase_done
+
+
+# Thread for handling the data as it comes
+def consume_llm_stream(character_queue, conn, server_tts=None, word_stream_fallback=None):
+    """Stream LLM output to the client; mirrors Pi blocking recv state machine.
+
+    Legacy (JBAZZ_LLM_WORD_STREAM): raw emotion UTF-8 -> raw segment frames ->
+        ##TerminateCharacterStreamState## -> raw shoot field.
+    Kokoro typed: MessageType.EMOTION -> TIMING_DATA + AUDIO_CHUNK per sentence ->
+        MessageType.END_OF_RESPONSE -> MessageType.SHOOT (b'True'|'False').
+    On EOS, missing phases are filled via _emit_eos_phase_gaps (see plan).
+    """
+
     def has_delimiter(s):
         #If it finds the delimiter. 
         #It should attempt to get the content to the left and right of the delimiter.
@@ -85,6 +165,34 @@ def consume_llm_stream(character_queue, conn):
         else:
             return None
         
+    if word_stream_fallback is None:
+        word_stream_fallback = USE_LLM_WORD_STREAM_FALLBACK
+    use_sentence_tts = server_tts is not None and not word_stream_fallback
+
+    def synth_sentence(sentence: str) -> None:
+        server_tts.synthesize_and_stream(sentence.strip(), conn, send_typed_message)
+
+    def drain_leading_sentences(buf: str) -> str:
+        """Emit complete sentences from the front of buf (streaming path)."""
+        while buf:
+            if buf.count("@") == 1:
+                break
+            m = _SENTENCE_BOUNDARY.search(buf)
+            if not m:
+                break
+            sentence = buf[: m.end()].strip()
+            buf = buf[m.end() :]
+            if sentence:
+                synth_sentence(sentence)
+        return buf
+
+    if use_sentence_tts:
+        server_tts.reset()
+
+    emotion_phase_done = False
+    dialogue_closed = False
+    shoot_phase_done = False
+
     LLM_STATE = LLM_OUTPUT_STATE.EMOTION
     s = ''
     full_response = ''
@@ -92,6 +200,36 @@ def consume_llm_stream(character_queue, conn):
     while True:
         chunk = character_queue.get()
         print(f"{chunk}")
+
+        if chunk is None:
+            if LLM_STATE == LLM_OUTPUT_STATE.CHARACTERS:
+                rest = (drain_leading_sentences(s) if use_sentence_tts else s).strip()
+                if rest:
+                    if use_sentence_tts:
+                        synth_sentence(rest)
+                        send_typed_message(conn, MessageType.END_OF_RESPONSE, b"")
+                        dialogue_closed = True
+                    else:
+                        send_message(conn, rest.encode("utf-8"))
+                        swords.append(rest)
+                        send_message(conn, _LEGACY_TERMINATE.encode("utf-8"))
+                        dialogue_closed = True
+                elif use_sentence_tts:
+                    send_typed_message(conn, MessageType.END_OF_RESPONSE, b"")
+                    dialogue_closed = True
+            emotion_phase_done, dialogue_closed, shoot_phase_done = _emit_eos_phase_gaps(
+                conn,
+                use_sentence_tts,
+                emotion_phase_done,
+                dialogue_closed,
+                shoot_phase_done,
+                LLM_STATE,
+                s,
+                has_delimiter,
+            )
+            print(f"thread completed (EOS), full LLM response: \n{full_response}\n")
+            print(f"Words segmented: {swords}")
+            return
 
         assert type(chunk) == str
         #Extend the s string with the new chunk streamed 
@@ -104,9 +242,12 @@ def consume_llm_stream(character_queue, conn):
                 #Send the emotion to JBAZZ. We can remove the delimiter. 
                 emotion = d_result[0]
                 print(f"emotion {emotion}")
-                byte_payload = emotion.encode('utf-8')
 
-                send_message(conn, byte_payload)
+                if use_sentence_tts:
+                    send_typed_message(conn, MessageType.EMOTION, emotion.encode("utf-8"))
+                else:
+                    send_message(conn, emotion.encode("utf-8"))
+                emotion_phase_done = True
 
                 #Update the state
                 LLM_STATE = LLM_OUTPUT_STATE.CHARACTERS
@@ -114,55 +255,52 @@ def consume_llm_stream(character_queue, conn):
                 #Clear the buffer
                 s = d_result[1]
 
-            else: continue
+            else:
+                continue
 
         elif LLM_STATE == LLM_OUTPUT_STATE.CHARACTERS:
+            if use_sentence_tts:
+                d_result = has_delimiter(s)
+                if d_result:
+                    print(f"TTS path: shoot delimiter found: {d_result}")
+                    extra_data = d_result[0]
+                    swords.append(extra_data)
+                    for sentence in _split_response_into_sentences(extra_data):
+                        synth_sentence(sentence)
+                    send_typed_message(conn, MessageType.END_OF_RESPONSE, b"")
+                    dialogue_closed = True
+                    LLM_STATE = LLM_OUTPUT_STATE.SHOOT
+                    s = d_result[1]
+                    continue
+
+                s = drain_leading_sentences(s)
+                continue
+
+            # Legacy word-at-a-time streaming
             r = re.search(r"""[ ,;:!?."]""", s)
             d_result = has_delimiter(s)
             if d_result:
                 print(f"D_result from characters delimiter found: {d_result}")
-                #Send any final data from the left of the delimiter
                 extra_data = d_result[0]
                 swords.append(extra_data)
 
-                byte_payload = extra_data.encode('utf-8')
-                send_message(conn, byte_payload)
-                #Ensure right half gets saved into s 
+                send_message(conn, extra_data.encode('utf-8'))
                 s = d_result[1]
-                #Terminate the word streaming state. 
                 LLM_STATE = LLM_OUTPUT_STATE.SHOOT
-                s2 = '''##TerminateCharacterStreamState##'''
-                print(f"sending done from char stream {s2}")
-                byte_payload = '''##TerminateCharacterStreamState##'''.encode('utf-8')
-                #Send message to JBAZZ that Shoot is next.
-                send_message(conn, byte_payload)
+                print("sending done from char stream ##TerminateCharacterStreamState##")
+                send_message(conn, '''##TerminateCharacterStreamState##'''.encode('utf-8'))
+                dialogue_closed = True
+                continue
 
-                # #Reset delimiter tracker
-                # character_stream_delimiter_counter = 0
-
-            #Yeah so this is a magic line that checks to see if we have the @ symbol for the delimiter.
-            #It stops the '.' character at the end of the Character Stream from counting the following @symbol as a word lol.
             if s.count('@') == 1:
                 continue
 
-            #This means that we have a completed word in our buffer. 
-            #Delimiter must not be in play otherwise we could send it as text to speak.
-            #r is a regex defined above.
             elif r:
-                if r:
-                    #Check if the data to the left of the matched character 
-                    complete = s[:r.end()]
-                    if complete:
-                        send_message(conn, complete.encode('utf-8'))
-                        swords.append(complete)
-                    #Keep right half which might have incomplete tokens
-                    s = s[r.end():]
-                # #this means that we need to send this word to JBAZZ
-                # byte_payload = s.encode('utf-8')
-                # send_message(conn, byte_payload)
-                # # print(f"sent s word {s}")
-                # swords.append(s)
-                # s = ''
+                complete = s[:r.end()]
+                if complete:
+                    send_message(conn, complete.encode('utf-8'))
+                    swords.append(complete)
+                s = s[r.end():]
 
         
         elif LLM_STATE == LLM_OUTPUT_STATE.SHOOT:
@@ -172,9 +310,12 @@ def consume_llm_stream(character_queue, conn):
                 #Send the emotion to JBAZZ. We can remove the delimiter. 
                 shoot = d_result[0]
                 print(f"shoot {shoot}")
-                byte_payload = shoot.encode('utf-8')
 
-                send_message(conn, byte_payload)
+                if use_sentence_tts:
+                    send_typed_message(conn, MessageType.SHOOT, parse_shoot_to_payload(shoot))
+                else:
+                    send_message(conn, shoot.encode('utf-8'))
+                shoot_phase_done = True
 
                 #Update the state
                 LLM_STATE = LLM_OUTPUT_STATE.NONE
@@ -184,7 +325,8 @@ def consume_llm_stream(character_queue, conn):
 
                 #Break the loop allowing the thread to join
                 break
-            else: continue
+            else:
+                continue
 
     print(f"thread completed, full LLM response: \n{full_response}\n")
     print(f"Words segmented: {swords}")
@@ -223,7 +365,10 @@ def handle_client(conn, addr):
             if is_llm_online:
                 #Run this in a thread b4 the llm ask call. 
                 #Iterate over the data queue until llm.ask finishes and the queue it created has been consumed. 
-                consume_llm_thread = threading.Thread(target=consume_llm_stream, args=(character_queue, conn))
+                consume_llm_thread = threading.Thread(
+                    target=consume_llm_stream,
+                    args=(character_queue, conn, server_tts),
+                )
                 consume_llm_thread.start()
                 llm_text_output = llm.ask(client_text, character_queue)
                 consume_llm_thread.join()
@@ -265,6 +410,18 @@ def run_server():
 
 
 if __name__ == "__main__":
+
+    if USE_LLM_WORD_STREAM_FALLBACK:
+        print("JBAZZ_LLM_WORD_STREAM enabled: legacy word-at-a-time TCP output (no Kokoro).")
+    else:
+        try:
+            from tts import ServerTTS
+
+            server_tts = ServerTTS()
+            print("ServerTTS (Kokoro): sentence streaming + typed audio/timing frames.")
+        except Exception as e:
+            print(f"ServerTTS unavailable ({e}); falling back to legacy word streaming.")
+            server_tts = None
 
     is_sst_online = False
     try:    

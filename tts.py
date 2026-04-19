@@ -1,7 +1,8 @@
 from kokoro import KPipeline
 import numpy as np
-import struct
 import json
+
+from tcp_framing import MessageType
 
 class ServerTTS:
     def __init__(self, voice="af_heart", speed=1.0, lang_code="a"):
@@ -34,11 +35,11 @@ class ServerTTS:
             
             # Send timing data BEFORE audio so Pi can prepare visemes
             if timings:
-                send_typed_message(conn, 0x02, json.dumps(timings).encode('utf-8'))
+                send_typed_message(conn, MessageType.TIMING_DATA, json.dumps(timings).encode('utf-8'))
             
             # Convert and send audio
             audio_int16 = (audio_float32 * 32767).astype(np.int16).tobytes()
-            send_typed_message(conn, 0x01, audio_int16)
+            send_typed_message(conn, MessageType.AUDIO_CHUNK, audio_int16)
             
             # Track cumulative duration
             self.audio_duration += len(audio_float32) / 24000

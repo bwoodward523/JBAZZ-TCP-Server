@@ -6,7 +6,7 @@ import sys
 
 def main():
     text = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "Hello, this is a test of the Kokoro text to speech pipeline."
-    voice = "af_heart"
+    voice = "am_michael"
     speed = 1.0
     output_file = "test_output.wav"
     sample_rate = 24000

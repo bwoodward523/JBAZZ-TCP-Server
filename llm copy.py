@@ -89,8 +89,6 @@ class LLMContext:
             for chunk in chat:
                 # print(chunk['message']['content'], end ='', flush=True)
                 character_queue.put(chunk['message']['content'])
-            character_queue.put(None)
-
             # response = requests.post(url, json=chat)
             # response.raise_for_status()
             # stream = response.json()
