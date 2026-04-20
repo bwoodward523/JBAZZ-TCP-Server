@@ -323,7 +323,14 @@ def consume_llm_stream(character_queue, conn, server_tts=None, word_stream_fallb
                 #Clear the buffer
                 s = d_result[1]
 
-                #Break the loop allowing the thread to join
+                # Drain any remaining chunks from the producer until the None
+                # sentinel, so leftover data does not leak into the next turn's
+                # queue (the producer keeps streaming trailing tokens + None
+                # after this point).
+                while True:
+                    trailing = character_queue.get()
+                    if trailing is None:
+                        break
                 break
             else:
                 continue
